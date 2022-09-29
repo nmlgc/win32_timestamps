@@ -1,0 +1,16 @@
+[package]
+name = "win32_timestamps"
+description = "Operations on all Win32 timestamps, including the ones that are not typically supported by Unix-native tools"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+clap = { version = "4.0.7", features = ["derive"] }
+jwalk = "0.6"
+parse-display = "0.6.0"
+winapi = { version = "0.3.9", features = ["handleapi"] }
+
+[profile.release]
+lto = true
