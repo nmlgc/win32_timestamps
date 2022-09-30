@@ -3,6 +3,7 @@
 
 use std::{
     ffi::c_void,
+    io,
     iter::once,
     os::windows::prelude::OsStrExt,
     path::{Path, PathBuf},
@@ -11,15 +12,17 @@ use std::{
 
 use clap::{Parser, Subcommand};
 use jwalk::WalkDir;
-use parse_display::Display;
+use parse_display::{Display, FromStr};
 use winapi::um::{
     errhandlingapi::GetLastError,
-    fileapi::{CreateFileW, SetFileTime, FILE_BASIC_INFO, OPEN_EXISTING},
+    fileapi::{
+        CreateFileW, SetFileInformationByHandle, SetFileTime, FILE_BASIC_INFO, OPEN_EXISTING,
+    },
     handleapi::{CloseHandle, INVALID_HANDLE_VALUE},
     minwinbase::FileBasicInfo,
     winbase::GetFileInformationByHandleEx,
     winbase::FILE_FLAG_BACKUP_SEMANTICS,
-    winnt::{FILE_SHARE_READ, HANDLE},
+    winnt::{FILE_SHARE_READ, HANDLE, LARGE_INTEGER},
 };
 use winapi::{
     shared::minwindef::FILETIME,
@@ -29,6 +32,12 @@ use winapi::{
 
 // Shared Win32 wrappers
 // ---------------------
+
+unsafe fn make_large_integer(v: i64) -> LARGE_INTEGER {
+    let mut ret: LARGE_INTEGER = std::mem::zeroed();
+    *ret.QuadPart_mut() = v;
+    ret
+}
 
 enum Win32OpenMode {
     Read,
@@ -97,6 +106,26 @@ unsafe fn get_file_basic_info(path: &Path) -> Option<FILE_BASIC_INFO> {
     }
     Some(ret)
 }
+
+unsafe fn set_file_basic_info(path: &Path, mut fi: FILE_BASIC_INFO) {
+    let handle = win32_open_file(path, Win32OpenMode::Write);
+    if handle == INVALID_HANDLE_VALUE {
+        return;
+    }
+
+    let valid = SetFileInformationByHandle(
+        handle,
+        FileBasicInfo,
+        &mut fi as *mut _ as *mut c_void,
+        std::mem::size_of::<FILE_BASIC_INFO>().try_into().unwrap(),
+    );
+    CloseHandle(handle);
+    if valid == 0 {
+        let err = GetLastError();
+        eprintln!("{}: error applying timestamps: {}", path.display(), err);
+    }
+}
+
 // ---------------------
 
 // Data structures
@@ -104,13 +133,14 @@ unsafe fn get_file_basic_info(path: &Path) -> Option<FILE_BASIC_INFO> {
 
 const HEADER_PREFIX: &str = "Version ";
 
-trait Timestamps: Sized + std::fmt::Display {
+trait Timestamps: std::fmt::Debug + std::fmt::Display + std::str::FromStr {
     fn version() -> i32;
     fn header() -> &'static str;
     fn get(path: &Path) -> Option<Self>;
+    fn set(self, path: &Path);
 }
 
-#[derive(Display)]
+#[derive(Display, FromStr, Debug)]
 #[display("{created}\t{modified}\t{changed}\t{accessed}")]
 struct V0Timestamps {
     created: i64,
@@ -136,6 +166,21 @@ impl Timestamps for V0Timestamps {
                 accessed: *fi.LastAccessTime.QuadPart(),
                 changed: *fi.ChangeTime.QuadPart(),
             })
+        }
+    }
+
+    fn set(self, path: &Path) {
+        unsafe {
+            set_file_basic_info(
+                path,
+                FILE_BASIC_INFO {
+                    CreationTime: make_large_integer(self.created),
+                    LastAccessTime: make_large_integer(self.accessed),
+                    LastWriteTime: make_large_integer(self.modified),
+                    ChangeTime: make_large_integer(self.changed),
+                    FileAttributes: 0, // keeps original attributes
+                },
+            )
         }
     }
 }
@@ -165,6 +210,32 @@ fn dump<V: Timestamps>(root: &Path) {
         }
     }
 }
+
+fn apply<V: Timestamps, T: std::io::BufRead>(mut lines: std::io::Lines<T>)
+where
+    <V as std::str::FromStr>::Err: std::fmt::Debug,
+{
+    let column_header = column_header::<V>();
+    assert_eq!(lines.next().unwrap().unwrap(), column_header);
+    for line in lines {
+        let line = line.unwrap();
+        let (path, timestamps) = line.split_once('\t').unwrap();
+        timestamps.parse::<V>().unwrap().set(Path::new(path));
+    }
+}
+
+fn apply_any<T: std::io::BufRead>(mut file: T) {
+    let mut version: [u8; HEADER_PREFIX.len()] = [0; HEADER_PREFIX.len()];
+    file.read_exact(&mut version).unwrap();
+    assert_eq!(version, HEADER_PREFIX.as_bytes());
+
+    let mut timestamps = file.lines();
+    let version = timestamps.next().unwrap().unwrap().parse::<i32>().unwrap();
+    match version {
+        0 => apply::<V0Timestamps, T>(timestamps),
+        _ => eprintln!("unknown version: {}", version),
+    }
+}
 // -------------------
 
 // Command line
@@ -186,6 +257,9 @@ enum CliCommand {
         /// Root of the path to be dumped
         root: PathBuf,
     },
+
+    /// Applies previously dumped timestamps from stdin.
+    Apply,
 }
 // ------------
 
@@ -194,5 +268,6 @@ fn main() {
 
     match args.command {
         CliCommand::Dump { root } => dump::<V0Timestamps>(&root),
+        CliCommand::Apply => apply_any(io::stdin().lock()),
     }
 }
