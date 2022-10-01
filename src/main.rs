@@ -10,6 +10,7 @@ use std::{
     ptr::null_mut,
 };
 
+use chrono::{DateTime, NaiveDateTime, Utc};
 use clap::{Parser, Subcommand};
 use jwalk::WalkDir;
 use parse_display::{Display, FromStr};
@@ -37,6 +38,17 @@ unsafe fn make_large_integer(v: i64) -> LARGE_INTEGER {
     let mut ret: LARGE_INTEGER = std::mem::zeroed();
     *ret.QuadPart_mut() = v;
     ret
+}
+
+fn filetime_to_datetime(filetime: i64) -> DateTime<Utc> {
+    let nano = 10000000;
+    DateTime::<Utc>::from_utc(
+        NaiveDateTime::from_timestamp(
+            (filetime / nano) - 11644473600,
+            (filetime % nano).try_into().unwrap(),
+        ),
+        Utc,
+    )
 }
 
 enum Win32OpenMode {
@@ -138,6 +150,7 @@ trait Timestamps: std::fmt::Debug + std::fmt::Display + std::str::FromStr {
     fn header() -> &'static str;
     fn get(path: &Path) -> Option<Self>;
     fn set(self, path: &Path);
+    fn format_human(self) -> String;
 }
 
 #[derive(Display, FromStr, Debug)]
@@ -183,6 +196,16 @@ impl Timestamps for V0Timestamps {
             )
         }
     }
+
+    fn format_human(self) -> String {
+        format!(
+            "{}\t{}\t{}\t{}",
+            filetime_to_datetime(self.created),
+            filetime_to_datetime(self.modified),
+            filetime_to_datetime(self.changed),
+            filetime_to_datetime(self.accessed)
+        )
+    }
 }
 // ---------------
 
@@ -193,8 +216,10 @@ fn column_header<V: Timestamps>() -> String {
     format!("Path\t{}", V::header())
 }
 
-fn dump<V: Timestamps>(root: &Path) {
-    println!("{}{}", HEADER_PREFIX, V::version());
+fn dump<V: Timestamps>(root: &Path, human: bool) {
+    if !human {
+        println!("{}{}", HEADER_PREFIX, V::version());
+    }
     println!("{}", column_header::<V>());
 
     for entry in WalkDir::new(root) {
@@ -203,10 +228,17 @@ fn dump<V: Timestamps>(root: &Path) {
             continue;
         }
         let entry = entry.unwrap();
+        let path = entry.path();
 
-        match V::get(&entry.path()) {
+        match V::get(&path) {
             None => continue,
-            Some(ts) => println!("{}\t{}", entry.path().display(), ts),
+            Some(ts) => {
+                if human {
+                    println!("{}\t{}", path.display(), ts.format_human())
+                } else {
+                    println!("{}\t{}", path.display(), ts)
+                }
+            }
         }
     }
 }
@@ -256,6 +288,11 @@ enum CliCommand {
     Dump {
         /// Root of the path to be dumped
         root: PathBuf,
+
+        /// Outputs timestamps in a human-readable format. Not supported by the
+        /// `apply` command.
+        #[arg(short = 'u', long, default_value_t = false)]
+        human: bool,
     },
 
     /// Applies previously dumped timestamps from stdin.
@@ -267,7 +304,7 @@ fn main() {
     let args = Cli::parse();
 
     match args.command {
-        CliCommand::Dump { root } => dump::<V0Timestamps>(&root),
+        CliCommand::Dump { root, human } => dump::<V0Timestamps>(&root, human),
         CliCommand::Apply => apply_any(io::stdin().lock()),
     }
 }

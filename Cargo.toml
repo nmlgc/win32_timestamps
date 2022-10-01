@@ -7,6 +7,7 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+chrono = "0.4.22"
 clap = { version = "4.0.7", features = ["derive"] }
 jwalk = "0.6"
 parse-display = "0.6.0"
